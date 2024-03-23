@@ -2,7 +2,6 @@
 Collect data from dive_reports/sampled files into a single 
 CSV or other data structure. 
 '''
-
 import argparse
 import re
 import logging
@@ -24,6 +23,11 @@ def parse_cli_args():
         help='TSV 1 second files from dive_reports/sampled')
 
     parser.add_argument(
+        '--datalog-dir',
+        '-l',
+        help='raw/datalog directory, used to parse heading from .HER files')
+
+    parser.add_argument(
         '--dvl-dive-report',
         '-d',
         help='DVL data file from parse_navest.py. Tab delimited columns '
@@ -32,12 +36,19 @@ def parse_cli_args():
     parser.add_argument(
         '--sealog-csv',
         '-s',
-        help='sealog-herc JSON file')
+        help='sealog-herc eventOnlyExport.csv file')
 
     parser.add_argument(
         '--csv-to',
         '-c',
         help='Path of output CSV file')
+
+    parser.add_argument(
+        '--interval-seconds',
+        '-i',
+        type=int,
+        default=1,
+        help='Interval between rows in output. Warning: Sealog events are likey to be missed if interval is greater than 1 second')
 
     return parser.parse_args()
 
@@ -104,30 +115,85 @@ def main(args):
     if args.sealog_csv is not None:
         parser_iter = read_csv_file(args.sealog_csv)
         parser_iter = remove_matching(parser_iter, 'event_free_text', '')
-        parser_iter = keep_only_fields(parser_iter, ['ts', 'event_free_text'])
+        parser_iter = keep_only_fields(parser_iter, ['ts', 'event_free_text', 'event_value'])
         parser_iter = rename_field(parser_iter, 'ts', 'time')
         parser_iter = rename_field(parser_iter, 'event_free_text', 'sealog_event_free_text')
+        parser_iter = rename_field(parser_iter, 'event_value', 'sealog_event_value')
         parser_iter = truncate_time_to_seconds(parser_iter)
-        parser_iter = extend_sealog_messages(parser_iter)
+        # parser_iter = extend_sealog_messages(parser_iter) ## needed if interval > 1s
         parsers.append(parser_iter)
 
     merged_data = merge_data(parsers)
 
     first_time = min([key for key in merged_data])
     last_time = max([key for key in merged_data])
+    
+    if args.datalog_dir is not None:
+        ## need to handle raw data after others, so we can use the 
+        ## start and end time of the other data sets to trim the raw files
+        her_paths = list_her_paths(
+            args.datalog_dir, 
+            datetime.fromisoformat(first_time), 
+            datetime.fromisoformat(last_time))
+
+        parser_iter = read_files(her_paths)
+        parser_iter = parse_octans(parser_iter)
+        parser_iter = truncate_time_to_seconds(parser_iter)
+
+        merged_data = merge_data([parser_iter], merged_data)
+
     time_iter = generate_time_sequence(
         start=first_time, 
         end=last_time, 
-        interval_seconds=5)
+        interval_seconds=args.interval_seconds)
+
+
 
     if args.csv_to is not None:
         write_csv(merged_data, args.csv_to, time_iter)
+
+
+def list_her_paths(datalog_dir, start_time, end_time):
+
+    for file_name in os.listdir(datalog_dir):
+        if not file_name.endswith('HER'):
+            continue
+
+        dslog_file_duration = 1
+        file_time = datetime.strptime(file_name[:13], '%Y%m%d_%H%M')
+        if file_time < start_time - timedelta(hours=dslog_file_duration):
+            continue
+
+        if file_time > end_time + timedelta(hours=dslog_file_duration):
+            continue
+
+        yield os.path.join(datalog_dir, file_name)
+
+
+def parse_octans(dslog_lines):
+    for line in dslog_lines:
+        fields = line.split()
+        if fields[3] != 'OCT':
+            continue
+
+        yield {
+            'time': fields[1],
+            'octans_heading': fields[10],
+            'octans_pitch': fields[11],
+            'octans_roll': fields[12]
+        }
 
 
 def read_file(path):
     with open(path) as in_file:
         for line in in_file:
             yield line
+
+def read_files(paths):
+    for path in paths:
+        with open(path) as in_file:
+            for line in in_file:
+                yield line
 
 
 def read_csv_file(path):
@@ -245,8 +311,8 @@ def generate_time_sequence(start, end, interval_seconds):
         yield result_time.strftime('%Y-%m-%dT%H:%M:%S')
 
 
-def merge_data(parsers):
-    merged_data = {}
+def merge_data(parsers, merged_data={}):
+    ## passing a dict to merged_data lets us add to an existing data set
     for parser in parsers:
         for data_record in parser:
             time_key = data_record['time']
